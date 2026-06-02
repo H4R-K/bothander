@@ -14,9 +14,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
-OWNER_ID = int(os.getenv("OWNER_ID")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 API_ID = os.getenv("API_ID", "") 
-API_HASH = os.getenv("API_HASH", ""))
+API_HASH = os.getenv("API_HASH", "")
 
 # 2. Bot, Dispatcher aur Database setup
 bot = Bot(token=BOT_TOKEN)
