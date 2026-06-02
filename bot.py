@@ -4,6 +4,11 @@ import imaplib
 import email
 from email.header import decode_header
 import re
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from telethon.sync import TelegramClient
+from telethon.sessions import StringSession
+import telethon.errors
 from aiohttp import web
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
@@ -28,6 +33,17 @@ dp = Dispatcher()
 db_client = AsyncIOMotorClient(MONGO_URL)
 db = db_client["OTP_Vault"]
 gmails_collection = db["gmails"]
+# Telegram accounts ke liye nayi collection
+tg_collection = db["telegram_accounts"]
+
+# Temp clients save karne ke liye dictionary (taaki login beech me kate na)
+temp_clients = {}
+
+# FSM States (Bot ko yaad dilane ke liye ki wo kya mang raha hai)
+class TgLogin(StatesGroup):
+    phone = State()
+    code = State()
+    password = State()
 
 # ==========================================
 # 🔒 OWNER CHECK (Security Layer)
@@ -199,6 +215,121 @@ async def get_mail_command(message: types.Message):
     await wait_msg.edit_text(f"📧 **Alias:** {alias}\n\n{result}")
 
 # ==========================================
+# 📱 TELEGRAM ACCOUNT LOGIN COMMANDS (FSM)
+# ==========================================
+
+@dp.message(Command("addtg"))
+async def add_tg_start(message: types.Message, state: FSMContext):
+    if not await is_owner(message): return
+    await message.answer("📱 Bina recharge wale Telegram account ka Phone Number bhejein\n(Country code ke sath, jaise +919876543210):")
+    await state.set_state(TgLogin.phone)
+
+@dp.message(TgLogin.phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    await state.update_data(phone=phone)
+    
+    wait_msg = await message.answer("⏳ Telegram server se connect kar raha hoon aur OTP bhej raha hoon...")
+    
+    # Telethon Client initialize karein
+    client = TelegramClient(
+        StringSession(), 
+        API_ID, 
+        API_HASH,
+        device_model="Titan OTP Vault",
+        system_version="Core 1.0",
+        app_version="TitanBot v1.0"
+    )
+    await client.connect()
+    
+    try:
+        # OTP bhejne ki request
+        code_request = await client.send_code_request(phone)
+        phone_code_hash = code_request.phone_code_hash
+        
+        # Is connection ko temporary save karein
+        temp_clients[message.from_user.id] = {
+            "client": client,
+            "phone_code_hash": phone_code_hash
+        }
+        
+        await wait_msg.edit_text("✅ OTP bhej diya gaya hai!\n\nKripya us account ke official Telegram app (777000 chat) me aaya hua login OTP yahan bhejein:")
+        await state.set_state(TgLogin.code)
+        
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Error: {e}\nKripya number check karein aur wapas /addtg bhejein.")
+        await state.clear()
+
+@dp.message(TgLogin.code)
+async def process_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    data = await state.get_data()
+    phone = data['phone']
+    
+    client_data = temp_clients.get(message.from_user.id)
+    if not client_data:
+        await message.answer("❌ Session timeout ho gaya. Kripya wapas /addtg start karein.")
+        await state.clear()
+        return
+        
+    client = client_data["client"]
+    phone_code_hash = client_data["phone_code_hash"]
+    
+    wait_msg = await message.answer("⏳ OTP verify kar raha hoon...")
+    
+    try:
+        # OTP ke sath Sign In karein
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+        
+        # Agar successful hua toh string banakar MongoDB me save karein
+        session_string = client.session.save()
+        await tg_collection.insert_one({"phone": phone, "session_string": session_string})
+        
+        await wait_msg.edit_text(f"✅ Success! Aapka Telegram account ({phone}) database me save ho gaya hai.")
+        await client.disconnect()
+        del temp_clients[message.from_user.id]
+        await state.clear()
+        
+    except telethon.errors.SessionPasswordNeededError:
+        # Agar 2-Step Verification laga ho
+        await wait_msg.edit_text("🔒 Is account par 2-Step Verification (Cloud Password) laga hai. Kripya apna password bhejein:")
+        await state.set_state(TgLogin.password)
+        
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ OTP Error: {e}\nAgar OTP galat hai toh wapas /addtg bhejein.")
+        await client.disconnect()
+        await state.clear()
+
+@dp.message(TgLogin.password)
+async def process_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    data = await state.get_data()
+    phone = data['phone']
+    
+    client_data = temp_clients.get(message.from_user.id)
+    client = client_data["client"]
+    
+    wait_msg = await message.answer("⏳ Password verify kar raha hoon...")
+    
+    try:
+        # Password ke sath Sign In karein
+        await client.sign_in(password=password)
+        
+        # Save to DB
+        session_string = client.session.save()
+        await tg_collection.insert_one({"phone": phone, "session_string": session_string})
+        
+        await wait_msg.edit_text(f"✅ Success! Aapka Telegram account ({phone}) database me save ho gaya hai (With 2FA).")
+        await client.disconnect()
+        del temp_clients[message.from_user.id]
+        await state.clear()
+        
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Password Error: {e}\nGalat password. Wapas /addtg try karein.")
+        await client.disconnect()
+        await state.clear()
+
+# ==========================================
 # 🌐 DUMMY WEB SERVER (For Render Port Binding)
 # ==========================================
 async def handle_ping(request):
@@ -216,6 +347,45 @@ async def web_server():
     print(f"Dummy web server started on port {port}")
 
 # ==========================================
+# 🔄 TELEGRAM SESSION KEEP-ALIVE (Auto-Ping)
+# ==========================================
+async def keep_sessions_alive():
+    while True:
+        try:
+            print("🔄 Checking all Telegram Sessions to keep them alive...")
+            cursor = tg_collection.find({})
+            accounts = await cursor.to_list(length=100)
+            
+            for acc in accounts:
+                session_str = acc.get("session_string")
+                phone = acc.get("phone")
+                
+                if session_str:
+                    # Custom Device Name yahan set kiya gaya hai
+                    client = TelegramClient(
+                        StringSession(session_str), 
+                        API_ID, 
+                        API_HASH,
+                        device_model="Titan OTP Vault",
+                        system_version="Core 1.0",
+                        app_version="TitanBot v1.0"
+                    )
+                    await client.connect()
+                    
+                    if await client.is_user_authorized():
+                        await client.get_me() # Ping server
+                        print(f"✅ Session kept alive for: {phone}")
+                    else:
+                        print(f"⚠️ Session expired or invalid for: {phone}")
+                        
+                    await client.disconnect()
+        except Exception as e:
+            print(f"❌ Keep Alive Error: {e}")
+            
+        # Har 12 ghante (43200 seconds) baad dobara check karega
+        await asyncio.sleep(43200)
+
+# ==========================================
 # 🚀 BOT RUNNER
 # ==========================================
 async def main():
@@ -223,7 +393,10 @@ async def main():
     # 1. Background me Dummy Web Server start karein Render ke liye
     asyncio.create_task(web_server())
     
-    # 2. Telegram Bot start karein
+    # 2. Telegram Sessions ko zinda rakhne wala task start karein
+    asyncio.create_task(keep_sessions_alive())
+    
+    # 3. Telegram Bot start karein
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
