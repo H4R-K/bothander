@@ -1,5 +1,6 @@
 import os
 import asyncio
+from aiohttp import web
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
