@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from motor.motor_asyncio import AsyncIOMotorClient
+import logging
+logging.basicConfig(level=logging.INFO) # <-- Yeh line add karein
 
 # 1. Environment variables load karein
 load_dotenv()
