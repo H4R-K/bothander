@@ -99,11 +99,31 @@ async def list_mails_command(message: types.Message):
     await message.answer(response)
 
 # ==========================================
+# 🌐 DUMMY WEB SERVER (For Render Port Binding)
+# ==========================================
+async def handle_ping(request):
+    return web.Response(text="Bot is Live and Running!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render automatic $PORT environment variable deta hai
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Dummy web server started on port {port}")
+
+# ==========================================
 # 🚀 BOT RUNNER
 # ==========================================
 async def main():
     print("Bot is starting...")
-    # Polling start karein
+    # 1. Background me Dummy Web Server start karein Render ke liye
+    asyncio.create_task(web_server())
+    
+    # 2. Telegram Bot start karein
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
