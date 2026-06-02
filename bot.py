@@ -1,5 +1,9 @@
 import os
 import asyncio
+import imaplib
+import email
+from email.header import decode_header
+import re
 from aiohttp import web
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
@@ -10,7 +14,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
-OWNER_ID = int(os.getenv("OWNER_ID"))
+OWNER_ID = int(os.getenv("OWNER_ID")
+API_ID = os.getenv("API_ID", "") 
+API_HASH = os.getenv("API_HASH", ""))
 
 # 2. Bot, Dispatcher aur Database setup
 bot = Bot(token=BOT_TOKEN)
@@ -31,6 +37,67 @@ async def is_owner(message: types.Message) -> bool:
         print(f"Unauthorized access alert! User ID: {message.from_user.id}")
         return False
     return True
+
+# ==========================================
+# 📧 GMAIL IMAP FETCHER (Background Worker)
+# ==========================================
+def fetch_latest_email_sync(email_address, app_password):
+    try:
+        # Gmail se connect karein
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(email_address, app_password)
+        mail.select("inbox")
+        
+        # Sabse latest mail (ALL me se aakhiri) search karein
+        status, messages = mail.search(None, "ALL")
+        email_ids = messages[0].split()
+        
+        if not email_ids:
+            return "📭 Aapka Inbox bilkul khali hai."
+            
+        latest_email_id = email_ids[-1]
+        status, msg_data = mail.fetch(latest_email_id, "(RFC822)")
+        
+        response_text = ""
+        for response_part in msg_data:
+            if isinstance(response_part, tuple):
+                msg = email.message_from_bytes(response_part[1])
+                
+                # 1. Subject Decode Karein
+                subject, encoding = decode_header(msg["Subject"])[0]
+                if isinstance(subject, bytes):
+                    subject = subject.decode(encoding if encoding else "utf-8")
+                
+                response_text += f"📌 **Subject:** {subject}\n\n"
+                
+                # 2. Body Extract Karein (Plain Text)
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            body = part.get_payload(decode=True).decode()
+                            break
+                else:
+                    body = msg.get_payload(decode=True).decode()
+                
+                # 3. OTP Extract Karein (Regex: 4-8 digit ka number dhundhega)
+                otps = re.findall(r'\b\d{4,8}\b', body)
+                if otps:
+                    response_text += f"🔑 **Possible OTP(s):** `{', '.join(otps[:3])}`\n\n"
+                else:
+                    response_text += "⚠️ Koi direct OTP detect nahi hua. Niche detail dekhein:\n\n"
+                    
+                # Message ka chota hissa dikhayein
+                response_text += f"📝 **Message:**\n{body[:250]}..."
+                
+        mail.logout()
+        return response_text
+    
+    except imaplib.IMAP4.error:
+        return "❌ Login Failed! App password ya Email galat hai."
+    except Exception as e:
+        return f"❌ Error: {e}"
+
 
 # ==========================================
 # 🤖 BOT COMMANDS
@@ -98,6 +165,36 @@ async def list_mails_command(message: types.Message):
         response += f"🔹 **{acc['alias']}** - `{acc['email']}`\n"
         
     await message.answer(response)
+
+@dp.message(Command("getmail"))
+async def get_mail_command(message: types.Message):
+    if not await is_owner(message): return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("⚠️ Sahi format: `/getmail <alias>`\nExample: `/getmail main`")
+        return
+        
+    alias = args[1]
+    
+    # 1. Database se account dhundhein
+    account = await gmails_collection.find_one({"alias": alias})
+    
+    if not account:
+        await message.answer(f"❌ '{alias}' naam ka koi account nahi mila. Pehle `/listmails` check karein.")
+        return
+        
+    # 2. Loading message bhejein
+    wait_msg = await message.answer("⏳ Inbox check kar raha hoon... kripya wait karein.")
+    
+    # 3. Background thread me IMAP function chalayein
+    email_address = account["email"]
+    app_password = account["app_password"]
+    
+    result = await asyncio.to_thread(fetch_latest_email_sync, email_address, app_password)
+    
+    # 4. Result Edit karke dikhayein
+    await wait_msg.edit_text(f"📧 **Alias:** {alias}\n\n{result}")
 
 # ==========================================
 # 🌐 DUMMY WEB SERVER (For Render Port Binding)
